@@ -1,0 +1,414 @@
+================================================================
+《仿 muduo 网络库 · 项目二学习笔记》
+来源:2026/08/03-04 读 muduo EventLoop 源码 + v1 代码核查
+配套文档:day01-v1-vs-muduo.md(差异对照 + 重构清单)
+================================================================
+
+
+================================================================
+一、设计主线:one loop per thread
+================================================================
+- 一句话:one loop per thread + 一切皆 fd + 无锁事件循环
+- 一个线程 = 一个 epoll = 一个 EventLoop
+- 三类 fd(socket / eventfd / timerfd)全注册进同一个 epoll
+- loop() 只做一件事:处理"可读事件"
+- 无锁的根基:单线程访问自己的数据没有竞态,锁的唯一作用是
+  挡"来自其他线程的错误访问"。isInLoopThread() 一行检查,
+  换整段代码不需要锁。
+
+
+================================================================
+二、线程归属:TLS 指针 + 登记 + FATAL
+================================================================
+【三层保障,各司其职】
+    namespace
+    {
+        thread_local EventLoop* t_loopInThisThread = nullptr;
+    }
+  ① 匿名 namespace   → 内部链接,符号只在本 .cc 可见,防跨编译单元冲突
+  ② thread_local     → 每线程独立一份变量,线程 A 赋值线程 B 看不见
+  ③ 构造登记 + FATAL → 同一线程建第二个 loop → LOG_FATAL 亮剑
+
+【为什么是裸指针,不是 thread_local EventLoop 对象】
+  1. 语义:one loop per thread 是"每线程至多一个"(只有 IO 线程有),
+     不是"每线程必须一个"。裸指针天然表达"可有可无",懒创建。
+  2. 生命周期:EventLoop 常是成员变量(如 TcpServer 的 mainLoop),
+     归调用者管;thread_local 对象会在线程退出时析构,而其他对象
+     还持有 EventLoop* → 悬垂指针。
+  3. FATAL 检查点:自动对象是编译器隐式构造,想在"第二次构造"时报错
+     没有代码点可写;new EventLoop 依然能造第二个。裸指针 + 构造检查
+     把报错位置钉死在唯一构造点。
+
+【__thread vs thread_local】
+  - __thread     = GCC 扩展,早期只能修饰平凡类型(所以 muduo 当年
+                   被迫用指针);MSVC 不支持
+  - thread_local = C++11 标准,全平台支持
+  - 现代化:纯关键字替换,方案不变——仍是"指针 + 懒创建 + 登记 + FATAL"
+
+【v1 现状】有 IsInLoopThread(线程 ID 比较)+ AssertInLoopThread(assert)
+  ⚠️ 无 TLS 登记 / FATAL;Loop() 里重设 tid_ → 归属漂移(见缺陷 2)
+
+
+================================================================
+三、唤醒机制:eventfd 而非 pipe
+================================================================
+【对比】
+  - pipe   : 字节流,64KB 缓冲,write 可能阻塞,读要处理边界
+  - eventfd: 64 位计数器,write 永不阻塞,read 一次取走全部并清零
+
+【muduo 用 eventfd 的三个理由】
+  1. write 永不阻塞(最重要):queueInLoop 可能被任何业务线程调用,
+     "唤醒线程绝不能因唤醒而阻塞"。pipe 有理论水满风险,eventfd 没有。
+  2. 清零简单:read 8 字节计数归零,一个 read 收工;LT 模式下不持续触发,
+     不会 busy loop。
+  3. 一个 fd 顶俩(pipe 要建两个)。
+
+【清零语义】
+  - LT 触发条件 = 计数器 > 0。read 不清零 → loop 处理完回 epoll_wait
+    又立刻被触发 → 100% CPU 空转。
+  - 信号聚合:连唤醒 3 次 → 计数 3 → loop 醒一次 read 取走全部归零
+    → 不丢唤醒,也不多醒。
+
+【易混点】eventfd 的计数是"唤醒次数",不是"loop 数量"。
+  重复 loop 的检测靠 TLS + FATAL,与 fd 无关。
+
+【v1 现状】已用 eventfd(0, EFD_NONBLOCK|EFD_CLOEXEC) + read 清零
+  ✓ 与 muduo 一致(用户自核"没有 eventfd"是纰漏)
+
+
+================================================================
+四、任务分发:runInLoop vs queueInLoop
+================================================================
+    void runInLoop(Functor cb)
+    {
+        if (isInLoopThread()) cb();              // 直接同步执行:无锁
+        else                  queueInLoop(std::move(cb));  // 入队
+    }
+
+    void queueInLoop(Functor cb)
+    {
+        { lock; pending_functors_.push_back(std::move(cb)); }
+        if (!isInLoopThread() || callingPendingFunctors_ || ...)
+            wakeup();
+    }
+
+【核心洞见】queue 不是 runInLoop 的"兜底",是另一个合法语义(延迟执行)。
+
+        直接同步执行          |        入队执行
+  时机   立即                 | 延迟到本轮事件处理完之后
+  开销   无锁、零成本          | 加锁 + 排队
+  重入   可能(回调里嵌套执行)  | 永不
+  前提   在 loop 线程 + 此刻执行安全 | 无
+
+【为什么在 loop 线程也要故意用 queueInLoop】
+  事件回调里 runInLoop(清理B) 会在 B 的读回调栈中当场嵌套执行,
+  状态互相踩踏、栈越叠越深。入队保证本轮事件处理完、doPendingFunctors
+  统一执行,顺序可控。
+
+【无锁的安全根基】不是靠锁,是靠 one loop per thread——单线程访问
+  自己的数据没有竞态。
+
+【v1 现状】已有 RunInLoop / QueueInLoop ✓
+
+
+================================================================
+五、队列执行:swap 快照(doPendingFunctors)
+================================================================
+    void doPendingFunctors()
+    {
+        vector<Functor> functors;
+        { lock; functors.swap(pending_functors_); }   // 锁只在这一瞬
+        for (auto& f : functors) f();                 // 执行阶段:完全无锁
+    }
+
+【swap 的两个好处】
+  1. 执行阶段无锁(缩短持锁时间):
+     - 执行期间其他线程可随时入队,不被锁阻塞
+     - functor 里调 EventLoop 接口不死锁(非递归锁;不 swap 直接持锁
+       遍历会死锁)
+  2. 快照语义:只执行入队时刻已有的那批,执行期间新入队的留在
+     (swap 后已空的)成员容器,下一轮执行。
+     - 防重入、防无限循环(若直接遍历,functor 每跑一次产出新任务,
+       for 永远跑不完)
+
+【为什么无条件 swap(空也 swap)】
+  - 空 swap = O(1) 指针交换,零成本
+  - "先检查空再 swap" 也要持锁(检查 empty 必须和其他线程 push 互斥),
+    锁省不掉,还多一条分支 → 反而更慢
+  - 锁外检查有 TOCTOU 竞态:检查为空后、拿锁前,另一线程 push → 漏处理
+  - 直接 swap = "判断有没有 + 取走全部" 合并成一步原子操作
+
+【可选微优化】执行完把空快照的 capacity swap 回成员,下次 push 免重新
+  分配(muduo 没做,v2 可加,优先级低)
+
+【v1 现状】已用 swap,无持锁遍历 ✓
+
+
+================================================================
+六、callingPendingFunctors_ 完整机制(核心)
+================================================================
+【定位】标志"当前正处于批次执行中",让入队者知道"我进的是哪一批"。
+
+【生命周期】
+    void doPendingFunctors()
+    {
+        vector<Functor> functors;
+        callingPendingFunctors_ = true;    // ① 批次开始——swap 之前就置位
+        { lock; functors.swap(pending_functors_); }
+        for (auto& f : functors) f();      // ② 批次执行
+        callingPendingFunctors_ = false;   // ③ 批次结束
+    }
+  为什么 swap 前置位:覆盖整个"处理批次"窗口。若 swap 后再置,
+  会露出"swap 完成、置位前"的窗口,期间入队者无法感知批次已开始。
+
+【读写归属:为什么普通 bool 就够,不用 atomic】
+  - 写:仅 loop 线程(doPendingFunctors 里)
+  - 读:queueInLoop(可能被其他线程调用)
+  - 关键场景 = loop 线程内再入队 → 同线程读,无竞态,读得准
+  - 跨线程读:条件1(!isInLoopThread())必真 → 必然唤醒,不依赖条件2
+    → 读错也不影响结果
+  ⇒ 只有决定性场景需要"准",而决定性场景恰好是同线程读,所以普通
+    bool 即可。
+
+【唯一决定性作用(挂死解药)】
+  loop 线程内、批次执行中再入队:
+      isInLoopThread() = true          → 条件1 假
+      callingPendingFunctors_ = true   → 条件2 真 → wakeup ✓ B 获救
+
+【与 swap 配套,不能互相替代】
+  - swap 决定"任务归属":B 必然进下一批
+  - 标志让入队者感知"我在下一批":必须唤醒,别指望本轮
+  - 不能用"容器非空"替代:swap 后 B 在成员容器里(非空),但它是
+    下一批;标志记录的是"批次状态",不是"容器状态"
+
+【RAII 加固】异常时 false 没执行 → 标志卡 true → 之后每次 queueInLoop
+  都空唤醒(性能退化,不挂死)。用 PendingFunctorGuard(构造置位/
+  析构复位)兜底。
+
+【v1 现状】完全没有这个标志 ❌(挂死缺陷的根源)
+
+
+================================================================
+七、唤醒三条件(queueInLoop)
+================================================================
+    if (!isInLoopThread() || callingPendingFunctors_ || hasPendingEvents())
+        wakeup();
+
+  ① !isInLoopThread():别的线程入队,loop 大概率在 poll() 里睡死,
+    必须唤醒
+  ② callingPendingFunctors_:正在执行批次,本批已 swap,新入队在
+    下一批,必须给下一轮设闹钟(挂死解药)
+  ③ hasPendingEvents():事件回调中途、本轮还有剩余事件未分发,
+    防御性保险(剩余事件处理时间不可控)
+
+【易混点】activeChannels_(本轮 epoll 返回未分发的事件)和
+  pendingFunctors_(软件队列里的回调)是两个队列。入队 cb 进
+  pendingFunctors_,不构成 hasPendingEvents 的"未处理事件"。
+  条件3 只在"站在事件回调里且本轮还有剩余事件"时为 true。
+
+【唤醒哲学】宁可多唤醒一次(开销≈0),绝不让任务挂起(延迟10秒)。
+  三个条件封死所有"可能错过立即处理"的窗口。
+
+【v1 现状】只有条件1 ❌
+
+
+================================================================
+八、定时器:TimerQueue 并进 poller
+================================================================
+【timerfd】一个"时间到了会可读"的 fd,和 socket 一样注册进 epoll。
+
+【一切皆 fd 的统一事件模型】
+    socket 连接  → 可读 ┐
+    eventfd(唤醒) → 可读 ├─ 全注册进同一个 epoll
+    timerfd(定时) → 可读 ┘ → loop() 只处理"可读事件"
+
+【为什么不直接用 epoll_wait 的 timeout 参数】
+  - 毫秒粒度,且每次循环前要算最近到期时间
+  - 语义混浊:返回后要自己区分"有事件"还是"超时"
+  - timerfd 到期是硬事件,精确、免维护、语义干净
+
+【为什么免开定时器线程】
+  定时线程的"睡到点→叫醒→执行回调"被内核(timerfd 超时)+ epoll
+  (就绪通知)接管,loop 线程自己就是定时器线程。保住 one loop per
+  thread 的纯粹性:没有第二根线程,就没有跨线程锁、没有回调同步问题。
+
+【TimerQueue 运作】
+  addTimer() → 插入 set(按到期时间排)→ 若是最早的 → timerfd_settime
+  → 到期 handleRead(读走超时次数清零)→ 取出到期 Timer 执行回调
+  → 重复定时器重新插回 set。增删改查全在 loop 线程内,无锁。
+
+【set vs 时间轮(按需选结构)】
+            时间轮(v1)       |  std::set(muduo)
+  插入/删除  O(1)            |  O(log n)
+  精度      受轮大小/槽宽限制  |  任意精度
+  适用      海量定时任务(内核级)| 网络库少量定时(几十上百个)
+  muduo 选 set:数量小,O(log n) 无压力,免去"轮大小定多少"的精度纠结。
+
+【v1 现状】TimerWheel(60, 1000)= 60 槽 × 1s,一圈 60s,精度 1s
+  ⚠️ 秒级以下的定时(如 500ms 踢连接)无法表达
+
+
+================================================================
+九、v1 现状核查(2026/08/04 直接读代码)
+================================================================
+  1. ✓ 已用 eventfd(0, EFD_NONBLOCK|EFD_CLOEXEC) + read 清零
+     (自核"没有 eventfd"是纰漏)
+  2. ✓ 已有 RunInLoop / QueueInLoop 双接口
+  3. ✓ doPendingFunctors 已用 swap 快照,无持锁遍历
+  4. ❌ 完全没有 callingPendingFunctors_ 标志
+  5. ❌ QueueInLoop 只有条件1(!IsInLoopThread())
+  6. ❌ Loop() 里重设 tid_ → 归属漂移
+  7. ⚠️ 时间轮精度 1s
+
+
+================================================================
+十、真实缺陷:挂死时序(完整)
+================================================================
+【触发条件】loop 线程内、doPendingFunctors 执行中、再入队
+  (即"functor 执行中调 queueInLoop",见场景:大任务分片续命、
+   v1 自己的 closeCallback→QueueInLoop 延迟删除、链式清理)
+
+【完整时序(四个维度:线程 / pending_functors_ / eventfd / loop 状态)】
+  T0 初始:  pending_functors_=[], eventfd=0, loop 阻塞在 Wait(-1)
+  T1 [线程X] QueueInLoop(A):pending=[A], !IsInLoopThread()=true→write
+           eventfd 0→1
+  T2 [loop] Wait 返回(nfds=1)→ HandleWakeup read 清零 eventfd 1→0
+  T3 [loop] doPendingFunctors 第一次 swap:
+           局部 functors=[A](开始执行), 成员 pending_functors_=[](空容器)
+  T4 [loop] A 执行中 QueueInLoop(B):
+           lock→ 成员 pending_functors_=[B]
+           !IsInLoopThread()=false(A 在 loop 线程跑)→ 不唤醒! ←致命
+           B 进"swap 后的新容器",本轮绝不会碰它
+  T5 [loop] A 跑完 → doPendingFunctors 结束 → 回 epoll_->Wait(-1)
+           → 无限阻塞。B 躺在成员容器里,没人预约下一轮闹钟
+  T6 B 的结局:
+           系统安静(无新连接/数据/timerfd 到期)→ B 永久挂死
+           运气好有新网络事件 → "顺路救活"(不保证,延迟不可控)
+
+【三个致命点】
+  ① swap 快照让 B 不属于当前批,成为设计上的必然
+  ② v1 唤醒逻辑只防"跨线程",不防"批次间隔";漏掉"本批结束后、
+     进入下一批"的唤醒
+  ③ Wait(-1) 无限阻塞把"运气差"放大成"无限延迟"
+
+【muduo 解药】条件2 callingPendingFunctors_ → 在 A 执行中入队时
+  触发 wakeup() → 给 B 预约"下一轮闹钟" → B 最多等一个批次周期。
+  muduo 保证:queueInLoop 之后最多等一个处理周期,绝不挂死。
+
+
+================================================================
+十一、v2 重构清单(实现顺序)
+================================================================
+  ① 线程归属:thread_local EventLoop* + 构造登记/析构清空 + FATAL;
+     Loop() 改 AssertInLoopThread()(不再重设 tid_,修归属漂移)
+  ② 引入 callingPendingFunctors_ 标志(doPendingFunctors 置位/复位,
+     用 RAII 守卫)
+  ③ 补唤醒条件2/3:
+        if (!IsInLoopThread() || callingPendingFunctors_ || handlingEvents_)
+            wakeup();
+  ④ doPendingFunctors 加 PendingFunctorGuard(构造置位/析构复位,
+     异常安全)
+  ⑤ TimerQueue 精度评估:时间轮(1s)→ std::set 是否值得换(可选)
+  ⑥ 压测对比:v2 vs v1 的 QPS、唤醒次数、无锁收益量化
+
+  保留不动:eventfd 唤醒+清零、RunInLoop/QueueInLoop、swap 快照、
+  Channel/Epoll 封装。
+
+
+================================================================
+十二、面试可能追问
+================================================================
+  1. "为什么 thread_local 指针而不是 thread_local 对象?"
+     → 每线程至多一个 + 生命周期可控 + FATAL 检查点
+  2. "eventfd 和 pipe 的区别?"
+     → write 永不阻塞 + 计数清零 + 信号聚合
+  3. "runInLoop 里线程判断错了会怎样?"
+     → 无锁碰共享数据 = 数据竞争
+  4. "queueInLoop 为什么要三条件唤醒?"
+     → 封死所有"可能错过立即处理"的窗口,宁多勿漏
+  5. "doPendingFunctors 为什么 swap?"
+     → 无锁执行 + 快照语义(防重入/防无限循环)
+  6. "为什么不开定时器线程?"
+     → timerfd + epoll 接管,保住 one loop per thread
+  7. "无锁的根基是什么?"
+     → 单线程访问自己的数据,不是靠锁是靠线程模型
+  8. "你的 queueInLoop 被 loop 线程自己调用会怎样?"(v1 挂死题)
+     → 缺 callingPendingFunctors_ 会挂死;muduo 条件2 兜住
+================================================================
+
+十三、EventLoop 面试 Q&A 速查(2026/08/13,面试冲刺版)
+================================================================
+设计骨架 30s 版:
+  EventLoop = 一个线程独占的事件循环。epoll(Poller)管 IO 事件 +
+  eventfd(wakeupFd)管线程唤醒 + TimerQueue(timerfd)管定时器 +
+  pendingFunctors_ 管跨线程任务队列。被 loop() 死循环串起:
+  poll 等事件 → 分发 Channel 回调 → 批量执行 pending → 再 poll。
+
+Q1. 什么是 one loop per thread?为什么"无锁"?
+  → 每线程一个 loop,一个 fd 从创建到销毁只归一个 loop 线程管。
+    回调在该线程内天然串行,无并发访问竞态。锁的唯一作用不是保护
+    并发,是挡"别的线程的错误访问"。我们核心层只有一把 std::mutex,
+    只护 pendingFunctors_。★加分:说"锁是设计不足的补丁,one loop
+    per thread 才是根治"。
+
+Q2. 为什么 thread_local 存指针而非对象?
+  → ①不是每线程都需要 loop(工作线程可能是计算任务) ②生命周期可控
+    (手动 new/delete) ③能做唯一性检查:构造时 if(t_loopInThisThread)
+    FATAL,同一线程建第二个 loop 响亮崩溃。存对象做不到检查。
+  ★加分:违反 one loop per thread 整个无锁模型崩塌,与其静默出错
+    不如大声死掉,让 bug 在测试期暴露。
+
+Q3. runInLoop vs queueInLoop?
+  → runInLoop:loop 线程内直接同步执行(isInLoopThread()为真),
+    零拷贝零唤醒;其他线程退化为入队。queueInLoop:无条件入队,
+    延迟到本轮事件处理完统一执行。好处:热点路径免去队列拷贝+
+    唤醒+回调跳转;对外接口统一,调用方不用知道自己在哪个线程。
+  ⚠陷阱:runInLoop 同步分支里重入(回调里再 runInLoop)→ 允许,
+    栈上递归,muduo 也这么做,注意栈深。
+
+Q4. 唤醒为什么三条件?muduo 为什么只两条件?★必考
+  queueInLoop 入队后,要不要写 eventfd 唤醒 poll() 里睡死的 loop?
+    条件1 !isInLoopThread()      → 别的线程入队,loop 大概率睡着,
+                                   不唤醒要等超时
+    条件2 callingPendingFunctors_ → 正在执行上一批任务(swap 已走),
+                                   新入队留到下一批,必须给下轮闹钟
+    条件3 eventHandling_          → 正在分发本批事件,剩余时间不可控,
+                                   防御保险
+  muduo 现代版只前两个:条件2已覆盖核心挂死路径,条件3是防御取舍。
+  ★加分:条件3等价 muduo 早期 poller_->hasPendingEvents(),用
+    eventHandling_ 标志更直接、不依赖 Poller 状态。
+
+Q5. doPendingFunctors 为什么 swap 快照而非直接遍历?
+  → ①执行阶段完全无锁:锁只在 swap 一瞬持有,执行期间其他线程可随时
+    入队不阻塞,functor 里调 queueInLoop 不死锁。②快照语义:只执行
+    入队时刻已有的一批,新入队留到下轮。直接遍历→functor 每跑一次
+    产新任务,for 永远跑不完(活锁)。
+  ★加分:这是无锁生产者/消费者经典套路,靠 swap 把"生产/消费"解耦。
+
+Q6. PendingFunctorGuard(RAII)干嘛?
+  → callingPendingFunctors_ 置位/复位不靠手写,靠 guard 构造/析构。
+    functor 抛异常→栈展开→析构必然执行→标志复位。没有它:标志卡
+    true→之后每次 queueInLoop 都白唤醒→慢性性能退化且难排查。
+  ★意义:回调异常不能破坏核心状态,异常安全是网络库用 C++ 的底线。
+
+Q7. 为什么 eventfd 而非 pipe?
+  → eventfd:1个fd、内核原子计数可累计、write 一次 syscall 极快;
+    pipe:2个fd、字节流要处理缓冲/EAGAIN。eventfd 专为"事件通知"
+    设计。★加分:eventfd 计数累加,多次 write(1) 但 read 一次清零,
+    "唤醒多少次只要醒一次",语义天然幂等。
+
+Q8. 为什么 threadId_ 是 const?
+  → 构造时确定归属线程,之后编译期禁止重赋值。修真实 bug:loop 漂移
+    到别的线程(误改后 isInLoopThread() 全失效,无锁模型静默崩塌)。
+    const 把运行时错误变成编译错误。★加分:用类型系统锁死不变量。
+
+Q9. pollReturnTime_ 干嘛?
+  → poll() 返回时刻,作为 handleEvent 参数传给本批所有就绪 Channel 回调。
+    好处:一批事件回调共享同一时间基准。若各回调各自 now(),处理一批
+    跨多个时刻,逻辑不一致(同批定时器一个用 T1 一个用 T2)。
+
+一句话总结(面试开场):
+  "EventLoop 用 one loop per thread 把并发问题串行化,用 eventfd 解决
+  线程间唤醒,用 swap 快照+RAII 保证任务队列无锁且异常安全——整个核心
+  只有一把锁,保护跨线程任务队列。"
+================================================================
