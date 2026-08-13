@@ -1,0 +1,32 @@
+# 编译产物
+out/
+build/
+*.o
+*.obj
+*.a
+*.exe
+*.out
+
+# IDE
+.vs/
+*.user
+*.suo
+.DS_Store
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+# 含 VM 远程连接信息（内网 IP/用户名），绝不提交
+CMakeSettings.json
+
+# 日志 & 测试报告
+*.log
+valgrind_report*.txt
+
+# Core dump
+core
+*.core
+
+# Google Test
+Testing/
