@@ -1,6 +1,8 @@
 #include "Channel.h"
 #include "EventLoop.h"
 
+#include <poll.h>   // POLLNVAL：glibc 的 <sys/epoll.h> 不提供 EPOLLNVAL
+
 Channel::Channel(EventLoop* loop, int fd)
 	: loop_(loop),
 	  fd_(fd),
@@ -23,9 +25,9 @@ void Channel::handleEvent(Timestamp receiveTime)
     {
         if (closeCallback_) closeCallback_();          
     }
-    if (revents_ & (EPOLLERR | EPOLLNVAL))
+    if (revents_ & (EPOLLERR | POLLNVAL))
     {
-        if (errorCallback_) errorCallback_();          
+        if (errorCallback_) errorCallback_();
     }
     if (revents_ & (EPOLLIN | EPOLLPRI | EPOLLRDHUP))
     {

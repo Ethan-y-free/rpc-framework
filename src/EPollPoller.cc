@@ -32,7 +32,7 @@ Timestamp EPollPoller::poll(int timeoutMs, Poller::ChannelList* activeChannels)
 	if (nfds > 0)
 	{
 		fillActiveChannels(nfds, activeChannels);
-		if (static_cast<int>(nfds) == events_.size())
+		if (static_cast<size_t>(nfds) == events_.size())
 		{
 			events_.resize(events_.size() * 2);
 		}
