@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(muduo_net LANGUAGES CXX)
+project(rpc_framework LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,6 +36,11 @@ file(GLOB NET_SOURCES CONFIGURE_DEPENDS
 list(FILTER NET_SOURCES EXCLUDE REGEX "demo_|_test\\.(cc|cpp)$|(^|/)main\\.(cc|cpp)$")
 
 add_library(net STATIC ${NET_SOURCES})
+
+# _GNU_SOURCE：eventfd / timerfd / epoll / accept4 等 Linux 特有 API 的声明
+# 在 glibc 里受 __USE_GNU 保护，严格 c++17（CMAKE_CXX_EXTENSIONS OFF）下
+# 必须显式开启，否则"未声明"。muduo 同款做法。
+target_compile_definitions(net PUBLIC _GNU_SOURCE)
 
 find_package(Threads REQUIRED)
 target_link_libraries(net PUBLIC Threads::Threads)

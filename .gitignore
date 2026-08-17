@@ -20,6 +20,9 @@ cmake_install.cmake
 # 含 VM 远程连接信息（内网 IP/用户名），绝不提交
 CMakeSettings.json
 
+# 含 GitHub PAT token，绝不提交
+.mcp.json
+
 # 日志 & 测试报告
 *.log
 valgrind_report*.txt
