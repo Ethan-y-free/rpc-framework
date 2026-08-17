@@ -412,3 +412,71 @@ Q9. pollReturnTime_ 干嘛?
   线程间唤醒,用 swap 快照+RAII 保证任务队列无锁且异常安全——整个核心
   只有一把锁,保护跨线程任务队列。"
 ================================================================
+
+
+================================================================
+十四、业务层压测与崩溃调试实战(2026/08/17)
+================================================================
+【背景】业务层(TcpServer 全链路 + 动态线程池)在 VM(双核)上
+  用 ping-pong 压测客户端(bench_client)实测 QPS。
+  ping-pong = 每连接串行"发请求→等 echo→发下一个",是 RPC
+  请求/响应的真实往返形态。
+
+【压测数据(demo_echo_tcp echo 服务器, 2 核 VM)】
+  单连接   : QPS 23614 / 往返延迟 41.7us  (1 loop 占 1 核)
+  8 连接   : QPS 25433 / 延迟 113us
+  16 连接  : QPS 21259 / 延迟 652us
+  32 连接  : QPS 21195 / 延迟 1280us
+  结论     : 单 loop 性能健康(2.4w/41.7us);总吞吐被 2 核锁死在
+            ~2.1w,延迟随连接数线性涨 = 标准 CPU 瓶颈特征。
+            one loop per thread 的多线程扩展依赖核数;单连接延迟
+            = 一次内核往返 + 用户态回调,无多余损耗。
+  ★自洽检查: 1/41.7us ≈ 23980 ≈ QPS 23614,互为倒数,证明单连接
+    瓶颈就是往返延迟,链路无额外开销。
+
+【崩溃定位实战(强面试点)】
+  现象:32 连接 × 5000 请求压测偶发 SIGABRT,完成请求数对不上
+  (160000 只完成 117993) → 服务器中途崩了,连接全断。
+
+  gdb 定位:Channel::~Channel → EventLoop::hasChannel →
+    assertInLoopThread → abort。
+  根因:TcpConnection 由 shared_ptr 管理,最后一个引用可能在任意
+    线程释放(TcpServer::removeConnectionInLoop 的 functor 在
+    mainLoop doPendingFunctors 快照析构时释放)。连接在 mainLoop
+    析构,但 Channel 属于 subLoop,Channel::~Channel 调 hasChannel
+    触发 assertInLoopThread → 跨线程 abort。
+
+  三条叠加路径:
+    ① handleClose 可被同一批事件触发两次(EPOLLERR + 读0 同时就绪)
+       → closeCallback → removeConnection 入队两次
+    ② removeConnectionInLoop 里 if(n != 1) return; 在重复移除时
+       直接返回 → connectDestroyed 从未入队,channel 没人摘除
+    ③ connectDestroyed(ioLoop 执行)可能先于 mainLoop 的 functor
+       快照析构执行 → functor 变最后一个持有者 → conn 在 mainLoop
+       线程析构
+
+  修复(三层):
+    ① handleClose 开头 if(state_ == kDisconnected) return; 防重入
+    ② removeConnectionInLoop 去掉 n!=1 提前 return,无条件
+       queueInLoop(connectDestroyed),保证 channel 摘除 + 析构在
+       ioLoop 完成
+    ③ Channel::~Channel 不再对"仍注册 poller" abort(shared_ptr
+       最后引用在任意线程释放是合法路径);TcpConnection 调整成员
+       顺序:socket_ 后声明先析构(先关 fd),内核 epoll 在 fd 关闭
+       时自动移除注册,残留的 poller 条目不会被回调
+
+【面试问法】
+  1. "TcpConnection 为什么可能跨线程析构?" → shared_ptr 的最后一
+     个引用在哪线程释放,对象就在哪析构;TcpServer 的 functor、
+     用户保存的 ptr 都可能成为最后持有者。
+  2. "怎么保证连接不在错误线程析构?" → 把析构职责交给
+     connectDestroyed:无条件调度到 ioLoop,channel 摘除由它负责;
+     Channel 析构容错 + fd 先关兜底。
+  3. "handleClose 为什么防重入?" → 一次 epoll 事件可同时带
+     EPOLLERR / EPOLLHUP / EPOLLIN,error 与 read 回调都会触发关闭。
+  4. "epoll 在 fd 关闭时会怎样?" → 内核自动移除该 fd 的注册;残留
+     的用户态 poller 条目(按 fd 索引)不会再有事件回调,所以关闭
+     fd 前摘除 channel 是防御而非必需。
+  5. "动态线程池怎么保证回收安全?" → 只回收"连接数=0 且无积压"的
+     loop,连续空闲 2 轮才回收;min/max 兜底防抖动。
+================================================================
