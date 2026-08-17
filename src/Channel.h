@@ -30,6 +30,7 @@ public:
     void disableWriting();
     void disableAll();
     bool isNoneEvent() const { return events_ == kNoneEvent; }
+    bool isWriting() const { return events_ & kWriteEvent; }   // 发送缓冲是否还有 EPOLLOUT 待写
 
     // 供 poller 填/读
     int fd() const { return fd_; }

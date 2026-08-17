@@ -161,6 +161,12 @@ bool EventLoop::isInLoopThread() const
     return threadId_ == std::this_thread::get_id();
 }
 
+size_t EventLoop::pendingTaskCount() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pendingFunctors_.size();
+}
+
 void EventLoop::assertInLoopThread() const
 {
     if (!isInLoopThread())

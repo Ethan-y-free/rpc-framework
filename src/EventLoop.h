@@ -46,6 +46,7 @@ public:
     bool isInLoopThread() const;
     void assertInLoopThread() const;
     static EventLoop* getEventLoopOfCurrentThread();
+    size_t pendingTaskCount() const;   // 只读积压任务量：动态线程池评估负载用
 
     // ---- 内部使用 ----
     Timestamp pollReturnTime() const { return pollReturnTime_; }
