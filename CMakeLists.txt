@@ -64,6 +64,12 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/demo_echo_tcp.cpp")
     target_link_libraries(demo_echo_tcp PRIVATE net)
 endif()
 
+# ---- QPS 压测客户端（ping-pong，配合 demo_echo_tcp）----
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench_client.cpp")
+    add_executable(bench_client bench_client.cpp)
+    target_link_libraries(bench_client PRIVATE Threads::Threads)
+endif()
+
 # ---- 后续 demo 模板（复制后改名字即可）----
 # if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/demo_http.cpp")
 #     add_executable(demo_http demo_http.cpp)
