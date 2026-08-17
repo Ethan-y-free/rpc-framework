@@ -12,8 +12,8 @@ TcpConnection::TcpConnection(EventLoop* loop, const std::string& name, int sockf
     : loop_(loop),
       name_(name),
       state_(kConnecting),
+      channel_(loop, sockfd),   // 先初始化（声明顺序：channel_ 在 socket_ 前）
       socket_(sockfd),
-      channel_(loop, sockfd),
       localAddr_(localAddr),
       peerAddr_(peerAddr)
 {
@@ -113,6 +113,10 @@ void TcpConnection::handleClose()
 {
     TcpConnectionPtr guardThis(shared_from_this());
     loop_->assertInLoopThread();
+    if (state_ == kDisconnected)
+    {
+        return;   // 防重入：同一批事件可能 EPOLLERR 与读0 同时触发 → handleClose 会被调两次
+    }
     channel_.disableAll();
     setState(kDisconnected);
     if (connectionCallback_)

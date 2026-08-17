@@ -53,8 +53,8 @@ private:
     std::map<EventLoop*, int> connCount_;  // 每个活跃 loop 的连接数
     std::map<EventLoop*, int> idleRounds_; // 连续空闲评估轮数
 
-    static const int kHighConnPerLoop = 32;      // 单 loop 平均连接数阈值 → 扩容
-    static const int kHighPendingPerLoop = 16;   // 单 loop 平均积压任务阈值 → 扩容
+    static const int kHighConnPerLoop = 2;       // 单 loop 平均连接数阈值 → 扩容（echo 轻量场景，连接一多就扩）
+    static const int kHighPendingPerLoop = 8;    // 单 loop 平均积压任务阈值 → 扩容
     static const int kIdleRoundsToRecycle = 2;   // 连续空闲 2 轮（约 6s）→ 回收
     static const double kResizeInterval;         // 评估周期（秒）
 

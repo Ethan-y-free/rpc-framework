@@ -83,13 +83,11 @@ void TcpServer::removeConnection(const TcpConnectionPtr& conn)
 void TcpServer::removeConnectionInLoop(const TcpConnectionPtr& conn)
 {
     loop_->assertInLoopThread();
-    size_t n = connections_.erase(conn->name());
-    if (n != 1)
-    {
-        return;   // 已移除（重复关闭）
-    }
-    threadPool_->unregisterConnection(conn->getLoop());   // 上报线程池：连接 -1
+    connections_.erase(conn->name());   // 幂等：重复关闭时不存在也不报错
+    threadPool_->unregisterConnection(conn->getLoop());   // 上报线程池：连接 -1（已防御负数）
     EventLoop* ioLoop = conn->getLoop();
-    // 回到 ioLoop 线程摘除 channel 并释放连接（conn 在 functor 持有，安全析构）
+    // 无论 map 中是否已移除，都调度 connectDestroyed：
+    // 它负责在 ioLoop 线程摘除 channel，并持有 conn 直到摘除之后——
+    // 否则 conn 可能被 mainLoop 的 functor 在错误线程释放，Channel 析构跨线程 abort。
     ioLoop->queueInLoop(std::bind(&TcpConnection::connectDestroyed, conn));
 }

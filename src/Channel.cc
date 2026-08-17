@@ -12,10 +12,15 @@ Channel::Channel(EventLoop* loop, int fd)
 
 Channel::~Channel()
 {
-	if (eventHandling_ || loop_->hasChannel(this))
-	{
-		abort();
-	}
+    // 只检查事件分发中析构（真 bug）。不再检查是否仍注册在 poller：
+    // TcpConnection 由 shared_ptr 管理，最后一个引用可能在任意线程释放
+    // （如 TcpServer 的 functor 在 mainLoop 析构），hasChannel 的 assertInLoopThread
+    // 会误伤。fd 由 Socket 拥有，关闭时内核 epoll 自动移除该 channel 的注册，
+    // 不会再有事件回调，残留的 poller 条目（按 fd 索引）无害。
+    if (eventHandling_)
+    {
+        abort();
+    }
 }
 
 void Channel::handleEvent(Timestamp receiveTime)

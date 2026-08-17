@@ -69,8 +69,8 @@ private:
     EventLoop* loop_;
     std::string name_;
     StateE state_;
-    Socket socket_;      // fd 所有者（析构时 close，晚于 channel_ 析构）
-    Channel channel_;    // 注册在 loop_ 的 poller（析构前必须先 remove()）
+    Channel channel_;    // 先声明、后析构：析构时 fd 已被 socket_ 关闭，epoll 自动清理
+    Socket socket_;      // 后声明、先析构：先关 fd，杜绝残留 channel 被 epoll 回调
     InetAddress localAddr_;
     InetAddress peerAddr_;
 
