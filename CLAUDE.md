@@ -18,8 +18,10 @@
   - `TimerQueue`：timerfd + std::set（按到期时间排序）+ TimerId 包装
   - `Channel` / `Poller` / `EPollPoller`：事件注册与分发
   - `Timer` / `Timestamp`：基础类型
-- **业务层**（待实现，RPC 驱动最小形态，先设计讲解→用户验收→代写）：
-  - `TcpServer` / `TcpConnection` / `Acceptor` / `Socket` / `InetAddress`（0 字节占位待实现）
+- **业务层**（已完成，含压测与崩溃修复）：
+  - `TcpServer` / `TcpConnection` / `Acceptor` / `Socket` / `InetAddress`
+  - `Buffer` 完整环形缓冲 + `EventLoopThread` / `EventLoopThreadPool`（动态伸缩线程池）
+  - VM 双核实测：单连接 23614 QPS / 41.7us 往返延迟
 - **RPC 主链路**（下一步）：
   - 协议：定长头 + 变长体
   - JSON 序列化
@@ -37,6 +39,6 @@
 ## 里程碑
 
 - ✅ 核心层（网络库底座）完成 + 5 commit 上线
-- 🔄 业务层（TcpServer/TcpConnection）设计讲解 → 验收 → 代写
+- ✅ 业务层（TcpServer 全链路 + 动态线程池 + Buffer + QPS 压测）完成
 - ⬜ RPC 主链路（协议定长头+变长体 / JSON 序列化 / RpcServer / RpcClient）
 - 🎯 8 月底投递第一波日常实习
