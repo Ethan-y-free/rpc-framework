@@ -37,6 +37,9 @@ list(FILTER NET_SOURCES EXCLUDE REGEX "demo_|_test\\.(cc|cpp)$|(^|/)main\\.(cc|c
 
 add_library(net STATIC ${NET_SOURCES})
 
+# net 库导出自己的头目录：链接它的 demo（demo_echo_tcp 等）自动获得 src/ 的 include 路径
+target_include_directories(net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # _GNU_SOURCE：eventfd / timerfd / epoll / accept4 等 Linux 特有 API 的声明
 # 在 glibc 里受 __USE_GNU 保护，严格 c++17（CMAKE_CXX_EXTENSIONS OFF）下
 # 必须显式开启，否则"未声明"。muduo 同款做法。
@@ -53,6 +56,12 @@ target_link_libraries(net PUBLIC Threads::Threads)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/demo_echo.cpp")
     add_executable(demo_echo demo_echo.cpp)
     target_link_libraries(demo_echo PRIVATE net)
+endif()
+
+# ---- 业务层验证：基于 TcpServer 的 echo server ----
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/demo_echo_tcp.cpp")
+    add_executable(demo_echo_tcp demo_echo_tcp.cpp)
+    target_link_libraries(demo_echo_tcp PRIVATE net)
 endif()
 
 # ---- 后续 demo 模板（复制后改名字即可）----
